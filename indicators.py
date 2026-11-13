@@ -91,6 +91,22 @@ def rel_volume(v: Sequence[float], n: int = 20) -> List[float]:
     return out
 
 
+def trend_efficiency(c: Sequence[float], n: int = 20) -> List[float]:
+    """Eficiencia direccional (Kaufman) CON SIGNO, en [-1, 1]. Causal.
+
+    (c[i] - c[i-n]) / suma(|Δc|) de las últimas n velas.
+    ~0 = lateral / ruido · +1 = subida limpia · -1 = bajada limpia. Antes de n velas devuelve 0.
+    """
+    out = [0.0] * len(c)
+    if n < 1 or len(c) <= n:
+        return out
+    diffs = [0.0] + [abs(c[k] - c[k - 1]) for k in range(1, len(c))]
+    for i in range(n, len(c)):
+        path = sum(diffs[i - n + 1:i + 1])
+        out[i] = (c[i] - c[i - n]) / path if path > 1e-12 else 0.0
+    return out
+
+
 @dataclass
 class Bucket:
     key: int

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import unittest
 from unittest import mock
 
@@ -104,6 +105,98 @@ class TestLiveLoop(unittest.TestCase):
             asyncio.run(sc.scan_once())
         self.assertIsNone(tracker.has_open("TEST-USDT"))
         self.assertTrue(any("CBC cambió a ROJO" in m for m in tg.sent), tg.sent)
+
+    def _red_pullback(self, boundary):
+        rows = series_ending_at(boundary)
+        last = rows[-1]
+        rows[-1] = Candle(last.t, last.o + 0.8, last.o + 0.9, last.o + 0.4, last.o + 0.5, 1000.0)
+        return rows
+
+    def _scanner_with_six(self, cfg, boundary):
+        """6 pares con la MISMA vela de señal; solo cambia el volumen 24h (=> el ranking)."""
+        bingx, tg = FakeBingX(), FakeTG()
+        sc = Scanner(cfg, bingx, tg, Tracker(cfg))
+        sc.universe = {}
+        for k, vol in enumerate([2e6, 5e6, 5e7, 2e8, 5e8, 2e9]):
+            sym = f"C{k}-USDT"
+            bingx.candles[sym] = self._red_pullback(boundary)
+            sc.universe[sym] = SymbolMeta(sym, price_prec=2, quote_volume=vol)
+        sc._universe_ts = 1e18
+        return sc, tg
+
+    def test_only_top_n_sent_in_rank_order(self):
+        cfg = mk_cfg(top_n=4)
+        boundary = (NOW0 * 1000 // LTF) * LTF
+        sc, tg = self._scanner_with_six(cfg, boundary)
+        with mock.patch("time.time", return_value=boundary / 1000 + 5):
+            asyncio.run(sc.scan_once())
+        # 1 resumen TOP + 4 señales (las 2 menos líquidas / de menor ranking se quedan fuera)
+        self.assertEqual(len(tg.sent), 5, tg.sent)
+        self.assertIn("TOP 4 entradas", tg.sent[0])
+        order = [re.search(r"(?:LONG|SHORT) · (C\d-USDT)", m).group(1) for m in tg.sent[1:]]
+        self.assertEqual(order, ["C5-USDT", "C4-USDT", "C3-USDT", "C2-USDT"])
+        self.assertIn("Ranking #1 de 4", tg.sent[1])
+        self.assertIn("Ranking #4 de 4", tg.sent[4])
+        self.assertEqual(sorted(sc.tracker.trades), ["C2-USDT", "C3-USDT", "C4-USDT", "C5-USDT"])
+
+    def test_next_best_are_picked_when_top_already_in_trade(self):
+        cfg = mk_cfg(top_n=2)
+        boundary = (NOW0 * 1000 // LTF) * LTF
+        sc, tg = self._scanner_with_six(cfg, boundary)
+        with mock.patch("time.time", return_value=boundary / 1000 + 5):
+            asyncio.run(sc.scan_once())
+        self.assertEqual(sorted(sc.tracker.trades), ["C4-USDT", "C5-USDT"])
+        # misma vela otra vez (p.ej. reinicio): C4/C5 ya están en operación o alertadas -> salen C3 y C2
+        sc.tracker.last_alert.clear()
+        tg.sent.clear()
+        with mock.patch("time.time", return_value=boundary / 1000 + 20):
+            asyncio.run(sc.scan_once())
+        self.assertEqual(sorted(sc.tracker.trades), ["C2-USDT", "C3-USDT", "C4-USDT", "C5-USDT"])
+
+    def test_min_rank_blocks_everything(self):
+        cfg = mk_cfg(top_n=4, min_rank=99.0)
+        boundary = (NOW0 * 1000 // LTF) * LTF
+        sc, tg = self._scanner_with_six(cfg, boundary)
+        with mock.patch("time.time", return_value=boundary / 1000 + 5):
+            asyncio.run(sc.scan_once())
+        self.assertEqual(tg.sent, [])
+        self.assertEqual(sc.tracker.trades, {})
+
+    def test_market_bias_from_reference_symbol(self):
+        cfg = mk_cfg(market_bias=True)
+        boundary = (NOW0 * 1000 // LTF) * LTF
+        sc = Scanner(cfg, FakeBingX(), FakeTG(), Tracker(cfg))
+        now_ms = boundary + 5000
+        self.assertEqual(sc.market_bias_for(series_ending_at(boundary), now_ms), 1)
+        self.assertEqual(sc.market_bias_for(None, now_ms), 0)
+        self.assertEqual(sc.market_bias_for(series_ending_at(boundary)[-30:], now_ms), 0)  # pocas velas
+
+    def test_btc_bias_only_applies_to_crypto(self):
+        """Mismo par de señales; con BTC bajista el LONG cripto pierde puntos y el LONG TradFi no."""
+        cfg = mk_cfg(market_bias=True, top_n=4)
+        boundary = (NOW0 * 1000 // LTF) * LTF
+        bingx, tg = FakeBingX(), FakeTG()
+        sc = Scanner(cfg, bingx, tg, Tracker(cfg))
+        down = []
+        for k in range(300):
+            t = boundary - (300 - k) * LTF
+            o = 300 - 0.5 * k
+            down.append(Candle(t, o, o + 0.1, o - 0.9, o - 0.8, 1000.0))
+        bingx.candles["BTC-USDT"] = down
+        bingx.candles["ALT-USDT"] = self._red_pullback(boundary)
+        bingx.candles["NCSKTSLA2USD-USDT"] = self._red_pullback(boundary)
+        sc.universe = {"BTC-USDT": SymbolMeta("BTC-USDT", price_prec=2),
+                       "ALT-USDT": SymbolMeta("ALT-USDT", price_prec=2, quote_volume=5e7),
+                       "NCSKTSLA2USD-USDT": SymbolMeta("NCSKTSLA2USD-USDT", kind="tradfi", price_prec=2,
+                                                       quote_volume=5e7)}
+        sc._universe_ts = 1e18
+        with mock.patch("time.time", return_value=boundary / 1000 + 5):
+            asyncio.run(sc.scan_once())
+        by_sym = {m.split("· ")[1].split("<")[0].split()[0]: m for m in tg.sent if "Ranking #" in m}
+        self.assertIn("ALT-USDT", by_sym)
+        self.assertIn("NCSKTSLA2USD-USDT", by_sym)
+        self.assertIn("Mercado 0%", by_sym["ALT-USDT"])            # LONG contra un BTC bajista
+        self.assertIn("Mercado 50%", by_sym["NCSKTSLA2USD-USDT"])  # TradFi: BTC no aplica (neutro)
 
     def test_no_signal_on_green_candle(self):
         cfg = mk_cfg()
