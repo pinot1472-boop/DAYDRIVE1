@@ -1,387 +1,445 @@
-"""DAYDRIVE v1 · residual session rank + squeeze + EMA/VWAP pullback."""
+"""Motor de señales: CBC (LTF + HTF) + confluencias + plan de trade (SL / TP / R:R)."""
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-import config
+from config import MAX_SCORE, Config
+from indicators import (NAN, atr_wilder, bucketize, cbc_states, ema, is_nan,
+                         rel_volume, trend_efficiency, vwap_daily)
+from models import Candle, Ema20Alert, Signal
+
+DAY_MS = 86_400_000
+MIN_BARS = 250  # mínimo de velas cerradas para evaluar (EMA200 / HTF estables)
 
 
 @dataclass
-class Signal:
-    symbol: str
-    side: str  # LONG | SHORT
-    src: str  # PB | SQZ
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
-    score: int
-    atr: float
-    rvol: float
-    resid_pct: float  # cross-section residual rank 0-100
-    resid_ret: float  # residual return in window
-    squeeze: bool
-    reason: str
-    level_px: float = 0.0
-    confirm_tag: str = ""
-    ts: float = field(default_factory=lambda: datetime.now(timezone.utc).timestamp())
+class Series:
+    t: List[int]
+    o: List[float]
+    h: List[float]
+    l: List[float]
+    c: List[float]
+    v: List[float]
+    ema9: List[float]
+    ema20: List[float]
+    ema200: List[float]
+    atr: List[float]
+    vwap: List[float]
+    rvol: List[float]
+    cbc: List[bool]
+    htf_state: List[Optional[bool]]
+    htf_cloud: List[Optional[bool]]
+    pdh: List[float]
+    pdl: List[float]
+    pdc: List[float]
+    er: List[float]  # eficiencia direccional con signo (20 velas), en [-1, 1]
 
 
-def utc_hour() -> int:
-    return datetime.now(timezone.utc).hour
+def htf_series(t, o, h, l, c, htf_ms: int, use_forming: bool):
+    """Estado CBC y nube EMA 9/20 del HTF visto desde cada vela LTF.
 
-
-def in_session() -> bool:
-    h = utc_hour()
-    return config.SESSION_START <= h < config.SESSION_END
-
-
-def _ema(vals: list[float], length: int) -> list[float]:
-    if not vals or length < 1:
-        return []
-    k = 2.0 / (length + 1)
-    out = [vals[0]]
-    for i in range(1, len(vals)):
-        out.append(vals[i] * k + out[-1] * (1 - k))
-    return out
-
-
-def _atr(h: list[float], l: list[float], c: list[float], length: int) -> list[float]:
-    trs = []
-    for i in range(len(c)):
-        if i == 0:
-            trs.append(h[i] - l[i])
-        else:
-            trs.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
-    # RMA-like
-    out = [trs[0]]
-    alpha = 1.0 / length
-    for i in range(1, len(trs)):
-        out.append(out[-1] * (1 - alpha) + trs[i] * alpha)
-    return out
-
-
-def _sma(vals: list[float], length: int) -> list[float]:
-    out = []
-    s = 0.0
-    for i, v in enumerate(vals):
-        s += v
-        if i >= length:
-            s -= vals[i - length]
-        if i >= length - 1:
-            out.append(s / length)
-        else:
-            out.append(s / (i + 1))
-    return out
-
-
-def _percentile_rank(value: float, series: list[float]) -> float:
-    if not series:
-        return 50.0
-    below = sum(1 for x in series if x <= value)
-    return 100.0 * below / len(series)
-
-
-def session_active() -> bool:
-    return in_session()
-
-
-def residual_return(
-    closes: list[float],
-    btc_closes: list[float],
-    rows: list[dict],
-    end_idx: int,
-) -> Optional[float]:
-    """Return residual (coin - BTC) over Europe window bars of the current UTC day."""
-    if end_idx < 5 or not btc_closes or len(btc_closes) != len(closes):
-        return None
-    start_h = config.RESID_START_HOUR
-    end_h = config.RESID_END_HOUR
-    t_ref = int(rows[end_idx].get("time") or 0)
-    if t_ref <= 0:
-        return None
-    day0 = (t_ref // 1000) // 86400
-    i0 = i1 = None
-    for j in range(max(0, end_idx - 60), end_idx + 1):
-        tj = int(rows[j].get("time") or 0)
-        if tj <= 0:
-            continue
-        dayj = (tj // 1000) // 86400
-        if dayj != day0:
-            continue
-        hj = int((tj // 1000) % 86400 // 3600)
-        if hj >= start_h and i0 is None:
-            i0 = j
-        if hj < end_h:
-            i1 = j
-    # if still in Europe window, use from start to now
-    h_now = int((t_ref // 1000) % 86400 // 3600)
-    if h_now < end_h:
-        i1 = end_idx
-    if i0 is None or i1 is None or i1 <= i0:
-        # fallback: last N bars
-        n = max(config.RESID_MIN_BARS, 6)
-        if end_idx < n:
-            return None
-        i0, i1 = end_idx - n, end_idx
-    if closes[i0] <= 0 or btc_closes[i0] <= 0:
-        return None
-    r_coin = closes[i1] / closes[i0] - 1.0
-    r_btc = btc_closes[i1] / btc_closes[i0] - 1.0
-    return r_coin - r_btc
-
-
-def is_squeezed(h: list[float], l: list[float], c: list[float], i: int) -> tuple[bool, float]:
-    atr_s = _atr(h, l, c, config.ATR_SHORT)
-    atr_l = _atr(h, l, c, config.ATR_LONG)
-    if i >= len(atr_s) or i >= len(atr_l) or atr_l[i] <= 0:
-        return False, 50.0
-    ratio = atr_s[i] / atr_l[i]
-    look = min(config.SQUEEZE_LOOKBACK, i)
-    hist = [atr_s[j] / atr_l[j] for j in range(i - look, i + 1) if atr_l[j] > 0]
-    pct = _percentile_rank(ratio, hist)
-    return pct <= config.SQUEEZE_PCT_MAX, pct
-
-
-def asia_sweep_bar(h: list[float], l: list[float], c: list[float], o: list[float], i: int, atr: float) -> bool:
-    """Heuristic: tall wick beyond body after Asia — leave to IPDA."""
-    if not config.SKIP_ASIA_GRAB or atr <= 0:
-        return False
-    # only relevant early day
-    if utc_hour() > 14:
-        return False
-    body = abs(c[i] - o[i])
-    upper = h[i] - max(c[i], o[i])
-    lower = min(c[i], o[i]) - l[i]
-    # long upper wick close mid/low or long lower wick close mid/high
-    if upper > 0.8 * atr and upper > 1.5 * max(body, 1e-12) and c[i] < o[i]:
-        return True
-    if lower > 0.8 * atr and lower > 1.5 * max(body, 1e-12) and c[i] > o[i]:
-        return True
-    return False
-
-
-def analyze(
-    symbol: str,
-    rows: list[dict],
-    btc_rows: Optional[list[dict]] = None,
-    resid_rank_pct: float = 50.0,
-    resid_ret: float = 0.0,
-    btc_bull: bool = True,
-) -> Optional[Signal]:
+    use_forming=True  -> incluye la vela HTF en formación (igual que lookahead_on del
+                         indicador en tiempo real: el HTF puede girar con el cierre LTF actual).
+    use_forming=False -> solo la última vela HTF CERRADA (más lento, más conservador).
+    Sin mirar al futuro: la vela HTF en formación solo usa el cierre LTF actual.
     """
-    Build DAYDRIVE signal on last closed 15m bar.
-    resid_rank_pct: 100 = strongest residual long vs universe; 0 = weakest.
-    """
-    if not session_active():
-        return None
-    need = max(config.EMA_TREND, config.ATR_LONG, config.VOL_LEN) + 5
-    if not rows or len(rows) < need:
-        return None
+    n = len(c)
+    st: List[Optional[bool]] = [None] * n
+    cl: List[Optional[bool]] = [None] * n
+    buckets = bucketize(t, o, h, l, c, htf_ms)
+    a9, a20 = 2.0 / 10.0, 2.0 / 21.0
 
-    o = [float(r["open"]) for r in rows]
-    h = [float(r["high"]) for r in rows]
-    l = [float(r["low"]) for r in rows]
-    c = [float(r["close"]) for r in rows]
-    v = [float(r.get("volume") or 0) for r in rows]
+    states: List[bool] = []
+    e9s: List[float] = []
+    e20s: List[float] = []
+    state = False
+    e9: Optional[float] = None
+    e20: Optional[float] = None
+    for k, b in enumerate(buckets):
+        if k > 0:
+            pb = buckets[k - 1]
+            if state and b.c < pb.l:
+                state = False
+            elif (not state) and b.c > pb.h:
+                state = True
+        states.append(state)
+        e9 = b.c if e9 is None else a9 * b.c + (1 - a9) * e9
+        e20 = b.c if e20 is None else a20 * b.c + (1 - a20) * e20
+        e9s.append(e9)
+        e20s.append(e20)
 
-    i = len(c) - 2  # last closed
-    if i < need - 2:
-        return None
+    for k in range(1, len(buckets)):
+        b = buckets[k]
+        pb = buckets[k - 1]
+        for i in range(b.first, b.last + 1):
+            s = states[k - 1]
+            if use_forming:
+                px = c[i]
+                if s and px < pb.l:
+                    s = False
+                elif (not s) and px > pb.h:
+                    s = True
+                x9 = a9 * px + (1 - a9) * e9s[k - 1]
+                x20 = a20 * px + (1 - a20) * e20s[k - 1]
+            else:
+                x9, x20 = e9s[k - 1], e20s[k - 1]
+            st[i] = s
+            cl[i] = x9 >= x20
+    return st, cl
 
-    atr_s = _atr(h, l, c, config.ATR_LEN)
-    a = atr_s[i]
-    if a <= 0 or not math.isfinite(a):
-        return None
 
-    vol_ma = _sma(v, config.VOL_LEN)
-    rvol = (v[i] / vol_ma[i]) if vol_ma[i] > 0 else 0.0
+def prev_day_levels(t, h, l, c, ltf_ms: int):
+    """Máximo / mínimo / cierre del día UTC anterior COMPLETO (PDH / PDL / PDC)."""
+    n = len(t)
+    pdh = [NAN] * n
+    pdl = [NAN] * n
+    pdc = [NAN] * n
+    if n == 0:
+        return pdh, pdl, pdc
+    first_partial = (t[0] % DAY_MS) >= ltf_ms  # los datos empiezan a mitad de día
+    cur_day = None
+    d_hi = d_lo = d_cl = 0.0
+    days_seen = 0
+    prev = None
+    for i in range(n):
+        d = t[i] // DAY_MS
+        if d != cur_day:
+            if cur_day is not None:
+                if not (days_seen == 0 and first_partial):
+                    prev = (d_hi, d_lo, d_cl)
+                days_seen += 1
+            cur_day = d
+            d_hi, d_lo = h[i], l[i]
+        else:
+            d_hi = max(d_hi, h[i])
+            d_lo = min(d_lo, l[i])
+        d_cl = c[i]
+        if prev is not None:
+            pdh[i], pdl[i], pdc[i] = prev
+    return pdh, pdl, pdc
 
-    ema_f = _ema(c, config.EMA_FAST)
-    ema_s = _ema(c, config.EMA_SLOW)
-    ema_t = _ema(c, config.EMA_TREND)
 
-    trend_up = ema_f[i] > ema_s[i] and c[i] > ema_t[i]
-    trend_dn = ema_f[i] < ema_s[i] and c[i] < ema_t[i]
-
-    sqz, sqz_pct = is_squeezed(h, l, c, i)
-    # expansion bar: range vs ATR
-    bar_range = h[i] - l[i]
-    expanding = bar_range >= 1.0 * a and rvol >= config.EXPAND_RVOL
-
-    if asia_sweep_bar(h, l, c, o, i, a):
-        return None
-
-    # Direction from residual rank + local trend
-    want_long = resid_rank_pct >= config.MIN_RESID_RANK_PCT and trend_up
-    want_short = resid_rank_pct <= (100.0 - config.MIN_RESID_RANK_PCT) and trend_dn
-
-    if config.USE_BTC_ALIGN:
-        if want_long and not btc_bull:
-            want_long = False
-        if want_short and btc_bull:
-            # mild: allow short only if residual very weak
-            if resid_rank_pct > 20:
-                want_short = False
-
-    if not want_long and not want_short:
-        return None
-    if want_long and not config.ALLOW_LONG:
-        return None
-    if want_short and not config.ALLOW_SHORT:
-        return None
-
-    side = "LONG" if want_long else "SHORT"
-
-    # --- Trigger A: pullback to EMA fast/slow cluster ---
-    src = ""
-    level = 0.0
-    body = abs(c[i] - o[i])
-    body_ok = body >= config.MIN_BODY_ATR * a
-
-    if side == "LONG":
-        dist_f = abs(l[i] - ema_f[i]) / a
-        dist_s = abs(l[i] - ema_s[i]) / a
-        touched = l[i] <= ema_f[i] + 0.15 * a or l[i] <= ema_s[i] + 0.15 * a
-        reclaim = c[i] > ema_f[i] and c[i] > o[i]
-        near = min(dist_f, dist_s) <= config.PB_ATR_MAX
-        if touched and reclaim and near and rvol >= config.PB_RVOL_MIN and body_ok:
-            src = "PB"
-            level = min(ema_f[i], ema_s[i])
-    else:
-        dist_f = abs(h[i] - ema_f[i]) / a
-        dist_s = abs(h[i] - ema_s[i]) / a
-        touched = h[i] >= ema_f[i] - 0.15 * a or h[i] >= ema_s[i] - 0.15 * a
-        reclaim = c[i] < ema_f[i] and c[i] < o[i]
-        near = min(dist_f, dist_s) <= config.PB_ATR_MAX
-        if touched and reclaim and near and rvol >= config.PB_RVOL_MIN and body_ok:
-            src = "PB"
-            level = max(ema_f[i], ema_s[i])
-
-    # --- Trigger B: squeeze release + pullback continuation ---
-    if not src and config.USE_SQUEEZE and sqz and expanding:
-        # prior bars compressed; this bar expands in trend direction
-        if side == "LONG" and c[i] > o[i] and c[i] > ema_f[i] and rvol >= config.EXPAND_RVOL:
-            # prefer not chasing: close not too far from mid of bar
-            if (h[i] - c[i]) <= 0.55 * bar_range:
-                src = "SQZ"
-                level = ema_f[i]
-        if side == "SHORT" and c[i] < o[i] and c[i] < ema_f[i] and rvol >= config.EXPAND_RVOL:
-            if (c[i] - l[i]) <= 0.55 * bar_range:
-                src = "SQZ"
-                level = ema_f[i]
-
-    if not src:
-        return None
-
-    entry = c[i]
-    if side == "LONG":
-        sl = min(l[i], level) - config.SL_ATR * a * 0.35
-        # structural: below swing low of signal bar
-        sl = min(sl, l[i] - 0.15 * a)
-        risk = entry - sl
-        if risk <= 0 or risk > 3.5 * a:
-            return None
-        tp1 = entry + config.TP1_R * risk
-        tp2 = entry + config.TP2_R * risk
-    else:
-        sl = max(h[i], level) + config.SL_ATR * a * 0.35
-        sl = max(sl, h[i] + 0.15 * a)
-        risk = sl - entry
-        if risk <= 0 or risk > 3.5 * a:
-            return None
-        tp1 = entry - config.TP1_R * risk
-        tp2 = entry - config.TP2_R * risk
-
-    score = 40
-    # residual extremity
-    if side == "LONG":
-        score += int(min(25, (resid_rank_pct - 50) * 0.5))
-    else:
-        score += int(min(25, (50 - resid_rank_pct) * 0.5))
-    if src == "PB":
-        score += 12
-    if src == "SQZ":
-        score += 10
-        if sqz_pct <= 25:
-            score += 5
-    if rvol >= 1.5:
-        score += 8
-    elif rvol >= 1.2:
-        score += 4
-    if trend_up or trend_dn:
-        score += 8
-    if config.USE_BTC_ALIGN and ((side == "LONG" and btc_bull) or (side == "SHORT" and not btc_bull)):
-        score += 6
-    score = int(max(0, min(100, score)))
-
-    if score < config.MIN_SCORE:
-        return None
-
-    reason = (
-        f"{src} · resid rank {resid_rank_pct:.0f} ({resid_ret:+.2%}) · "
-        f"RVOL {rvol:.2f}x · sqz {sqz_pct:.0f} · EMA {config.EMA_FAST}/{config.EMA_SLOW}"
+def build_series(candles: List[Candle], cfg: Config) -> Series:
+    t = [x.t for x in candles]
+    o = [x.o for x in candles]
+    h = [x.h for x in candles]
+    l = [x.l for x in candles]
+    c = [x.c for x in candles]
+    v = [x.v for x in candles]
+    hs, hc = htf_series(t, o, h, l, c, cfg.htf_sec * 1000, cfg.htf_use_forming)
+    pdh, pdl, pdc = prev_day_levels(t, h, l, c, cfg.ltf_sec * 1000)
+    return Series(
+        t=t, o=o, h=h, l=l, c=c, v=v,
+        ema9=ema(c, 9), ema20=ema(c, 20), ema200=ema(c, 200),
+        atr=atr_wilder(h, l, c, cfg.atr_period),
+        vwap=vwap_daily(t, h, l, c, v),
+        rvol=rel_volume(v, 20),
+        cbc=cbc_states(h, l, c),
+        htf_state=hs, htf_cloud=hc,
+        pdh=pdh, pdl=pdl, pdc=pdc,
+        er=trend_efficiency(c, 20),
     )
 
+
+def _trigger_flip(S: Series, i: int, cfg: Config):
+    """Estrategia ORIGINAL: la señal nace cuando el "acuerdo CBC" (LTF + HTF) empieza."""
+    hs, hp = S.htf_state[i], S.htf_state[i - 1]
+    if hs is None or hp is None:
+        return None, "", False, "nodata"
+    ls, lp = S.cbc[i], S.cbc[i - 1]
+    long_now, long_prev = (ls and hs), (lp and hp)
+    short_now, short_prev = ((not ls) and (not hs)), ((not lp) and (not hp))
+    if long_now and not long_prev:
+        side = "LONG"
+    elif short_now and not short_prev:
+        side = "SHORT"
+    else:
+        return None, "", False, "no_setup"
+    flip_now = ls != lp
+    trigger = f"Flip CBC {cfg.ltf}" if flip_now else f"Flip CBC {cfg.htf} (HTF)"
+    reversal = flip_now and (S.cbc[i - 1] != S.cbc[i - 2])  # doble flip = "CBC Reversal"
+    return side, trigger, reversal, "ok"
+
+
+def _trigger_pullback(S: Series, i: int, cfg: Config):
+    """Estrategia PULLBACK (la que pidió el usuario), sobre el LTF (15m):
+
+      CBC VERDE (alcista) + cierra una vela ROJA   -> LONG  (compra el retroceso)
+      CBC ROJO  (bajista) + cierra una vela VERDE  -> SHORT (vende el rebote)
+
+    - Color de la vela = cierre vs apertura (roja: close < open, verde: close > open).
+    - El CBC debe ser del MISMO color antes y después de cerrar la vela: así la vela es un
+      retroceso DENTRO de la tendencia CBC y no la vela que la rompe (si una vela roja
+      cerrara por debajo del mínimo anterior, el CBC pasaría a rojo y NO se compra).
+    - Opcional (PULLBACK_REQUIRE_HTF): el CBC del HTF debe ir en la misma dirección.
+    """
+    ls, lp = S.cbc[i], S.cbc[i - 1]
+    if ls != lp:
+        return None, "", False, "no_setup"  # esta vela cambió el CBC: es un flip, no un retroceso
+    if ls and S.c[i] < S.o[i]:
+        side = "LONG"
+    elif (not ls) and S.c[i] > S.o[i]:
+        side = "SHORT"
+    else:
+        return None, "", False, "no_setup"
+    if cfg.pullback_require_htf:
+        hs = S.htf_state[i]
+        if hs is None:
+            return None, "", False, "nodata"
+        if hs != ls:
+            return None, "", False, "htf_contra"
+    if side == "LONG":
+        trigger = f"CBC {cfg.ltf} verde + vela roja (retroceso)"
+    else:
+        trigger = f"CBC {cfg.ltf} rojo + vela verde (rebote)"
+    return side, trigger, False, "ok"
+
+
+def cbc_against(side: str, cbc_state: bool) -> bool:
+    """True si el CBC (True = verde/alcista) está en contra de la operación."""
+    return (not cbc_state) if side == "LONG" else bool(cbc_state)
+
+
+# ---------------------------------------------------------------------------------------------
+# RANKING: puntuación de calidad 0-100 para elegir las N mejores entradas de cada cierre de vela.
+# Cada componente vale 0..1 y se multiplica por su peso (los pesos suman 100). Son heurísticas
+# razonadas, NO optimizadas: calibra con `python backtest.py --compare` antes de fiarte de ellas.
+# ---------------------------------------------------------------------------------------------
+RANK_WEIGHTS = {
+    "confluencia": 20,  # EMA cloud + VWAP + EMA200 + EMA cloud HTF a favor (0-4)
+    "htf": 12,          # el CBC del HTF va en la misma dirección
+    "tendencia": 14,    # tendencia limpia: eficiencia direccional 20v + pendiente de la EMA20
+    "retroceso": 14,    # el retroceso llega a "zona de valor" (cerca de la EMA20), no sobreextendido
+    "espacio": 10,      # recorrido libre hasta PDH/PDL/PDC (3R o más = máximo)
+    "stop": 8,          # stop ajustado (<= 1.0 ATR = máximo, 0 en MAX_SL_ATR): más R por % de movimiento
+    "vela": 8,          # vela de señal con rechazo (cierra lejos de su extremo) y cuerpo pequeño
+    "liquidez": 8,      # volumen 24h (1M USDT = 0 · 1B USDT = máximo): menos slippage / mechas
+    "mercado": 6,       # alineada con el CBC + nube EMA del mercado de referencia (BTC)
+}
+
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+
+def market_bias(S: "Series", i: int) -> int:
+    """+1 / -1 si el CBC y la nube EMA 9/20 del mercado de referencia (BTC) coinciden; 0 = mixto."""
+    if i < 1 or i >= len(S.c):
+        return 0
+    if S.cbc[i] and S.ema9[i] >= S.ema20[i]:
+        return 1
+    if (not S.cbc[i]) and S.ema9[i] < S.ema20[i]:
+        return -1
+    return 0
+
+
+def rank_parts(S: Series, i: int, is_long: bool, *, score: int, risk: float, atr: float,
+               room_r: Optional[float], liq: Optional[float], bias: int, cfg: Config) -> Dict[str, float]:
+    """Componentes del ranking (cada uno en 0..1)."""
+    sgn = 1.0 if is_long else -1.0
+    close = S.c[i]
+
+    hs = S.htf_state[i]
+    htf = 0.5 if hs is None else (1.0 if hs == is_long else 0.0)
+
+    er_dir = max(0.0, sgn * S.er[i])
+    slope = max(0.0, sgn * (S.ema20[i] - S.ema20[max(0, i - 8)]) / atr)
+    tendencia = 0.6 * _clamp01(er_dir / 0.5) + 0.4 * _clamp01(slope / 1.5)
+
+    if cfg.strategy == "pullback":
+        d = sgn * (close - S.ema20[i]) / atr  # distancia a la EMA20 en ATR, a favor = positiva
+        if d >= 0:
+            retroceso = 1.0 if d <= 0.8 else _clamp01(1.0 - (d - 0.8) / 1.7)  # 0 a partir de 2.5 ATR
+        else:
+            retroceso = _clamp01(1.0 + d / 1.5)  # por debajo de la EMA20: retroceso demasiado profundo
+    else:
+        retroceso = 0.5  # en la estrategia "flip" no hay retroceso que puntuar
+
+    espacio = 1.0 if room_r is None else _clamp01(room_r / 3.0)
+
+    r_atr = risk / atr
+    if r_atr <= 1.0:
+        stop = 1.0
+    else:
+        stop = _clamp01(1.0 - (r_atr - 1.0) / max(cfg.max_sl_atr - 1.0, 0.1))
+
+    rng = S.h[i] - S.l[i]
+    if rng > 0:
+        pos = (close - S.l[i]) / rng if is_long else (S.h[i] - close) / rng
+    else:
+        pos = 0.5
+    body = abs(S.c[i] - S.o[i])
+    vela = 0.6 * _clamp01(pos) + 0.4 * (1.0 - _clamp01(body / (1.5 * atr)))
+
+    # liq=None -> desconocida (neutra). liq=0 -> contrato muerto (0 puntos)
+    liquidez = 0.5 if liq is None else _clamp01(math.log10(max(liq, 1.0) / 1e6) / 3.0)
+    mercado = 0.5 if bias == 0 else (1.0 if (bias > 0) == is_long else 0.0)
+
+    return {
+        "confluencia": score / MAX_SCORE, "htf": htf, "tendencia": tendencia,
+        "retroceso": retroceso, "espacio": espacio, "stop": stop, "vela": vela,
+        "liquidez": liquidez, "mercado": mercado,
+    }
+
+
+def base_of(symbol: str) -> str:
+    """Activo subyacente de un símbolo de BingX: BTC-USDT y BTC-USDC -> 'BTC'."""
+    return symbol.split("-")[0]
+
+
+def select_top(cands: List[Signal], cfg: Config, mode: str = "rank", rng=None,
+               busy_bases=()) -> Tuple[List[Signal], int, int]:
+    """Elige las mejores señales de UN cierre de vela. Devuelve (elegidas, bajo_ranking_mínimo, recortadas).
+
+    Nunca elige dos señales del mismo subyacente (BTC-USDT y BTC-USDC serían la misma apuesta), ni
+    del subyacente de una operación ya abierta (`busy_bases`): así los 4 puestos son 4 ideas distintas.
+
+    mode="rank"   -> las TOP_N de mayor ranking (lo que hace el bot en vivo)
+    mode="random" -> TOP_N al azar entre las que superan MIN_RANK (línea base para el backtest)
+    mode="all"    -> todas las que superan MIN_RANK, sin límite (línea base para el backtest)
+    """
+    eligible = [s for s in cands if base_of(s.symbol) not in busy_bases]
+    pool = [s for s in eligible if s.rank >= cfg.min_rank]
+    low = len(eligible) - len(pool)
+    if mode == "random":
+        (rng if rng is not None else random).shuffle(pool)
+    else:
+        pool.sort(key=lambda s: (s.rank, s.score, s.rvol), reverse=True)
+    uniq, seen = [], set()
+    for s in pool:  # una sola señal por subyacente (la primera = la mejor)
+        b = base_of(s.symbol)
+        if b not in seen:
+            seen.add(b)
+            uniq.append(s)
+    if mode == "all" or cfg.top_n <= 0:
+        return uniq, low, len(pool) - len(uniq)
+    chosen = uniq[:cfg.top_n]
+    return chosen, low, len(pool) - len(chosen)
+
+
+def evaluate(S: Series, i: int, cfg: Config, symbol: str, liq: Optional[float] = None,
+             bias: int = 0) -> Tuple[Optional[Signal], str]:
+    """Evalúa la vela CERRADA i. Devuelve (señal | None, motivo_de_rechazo).
+
+    liq  = volumen 24h en USDT del par (solo para el ranking). bias = +1/-1/0 del mercado de referencia.
+    El ranking NO descarta nada aquí: solo ordena (el corte lo hace `select_top`)."""
+    if i < 2 or i >= len(S.c):
+        return None, "nodata"
+    trig = _trigger_pullback if cfg.strategy == "pullback" else _trigger_flip
+    side, trigger, reversal, why = trig(S, i, cfg)
+    if side is None:
+        return None, why
+    is_long = side == "LONG"
+
+    atr = S.atr[i]
+    if is_nan(atr) or atr <= 0:
+        return None, "nodata"
+    close = S.c[i]
+
+    htf_cloud = bool(S.htf_cloud[i])
+    conds = {
+        "ema_cloud": (S.ema9[i] >= S.ema20[i]) if is_long else (S.ema9[i] < S.ema20[i]),
+        "vwap": (close > S.vwap[i]) if is_long else (close < S.vwap[i]),
+        "ema200": (close > S.ema200[i]) if is_long else (close < S.ema200[i]),
+        "htf_cloud": htf_cloud if is_long else (not htf_cloud),
+    }
+    score = sum(1 for x in conds.values() if x)
+    if score < cfg.min_score:
+        return None, "score"
+
+    # ---- Plan de trade -------------------------------------------------------------
+    # Stop = nivel de flip CBC contrario (extremo de la vela de señal) + colchón ATR,
+    # acotado entre MIN_SL_ATR y MAX_SL_ATR veces el ATR.
+    # En pullback es justo la invalidez: si la vela siguiente cierra más allá del extremo de
+    # la vela de señal, el CBC cambia de color y la idea (CBC verde + compra) deja de valer.
+    entry = close
+    buf = cfg.sl_buffer_atr * atr
+    risk = (entry - (S.l[i] - buf)) if is_long else ((S.h[i] + buf) - entry)
+    min_risk, max_risk = cfg.min_sl_atr * atr, cfg.max_sl_atr * atr
+    if risk > max_risk:
+        if cfg.skip_wide_sl:
+            return None, "sl_wide"
+        risk = max_risk
+    if risk < min_risk:
+        risk = min_risk
+    sign = 1.0 if is_long else -1.0
+    sl = entry - sign * risk
+    tps = [entry + sign * r * risk for r in cfg.tp_r]
+
+    # Espacio libre hasta el siguiente nivel clave (PDH / PDL / PDC del día UTC anterior)
+    levels = [(n, p) for n, p in (("PDH", S.pdh[i]), ("PDL", S.pdl[i]), ("PDC", S.pdc[i])) if not is_nan(p)]
+    if is_long:
+        cands = [(n, p) for n, p in levels if p > entry]
+        nearest = min(cands, key=lambda x: x[1]) if cands else None
+    else:
+        cands = [(n, p) for n, p in levels if p < entry]
+        nearest = max(cands, key=lambda x: x[1]) if cands else None
+    room_r = abs(nearest[1] - entry) / risk if nearest else None
+    if room_r is not None and room_r < cfg.min_room_r:
+        return None, "room"
+
+    parts = rank_parts(S, i, is_long, score=score, risk=risk, atr=atr, room_r=room_r,
+                       liq=liq, bias=bias, cfg=cfg)
+    rank = round(sum(RANK_WEIGHTS[k] * v for k, v in parts.items()), 1)
+
+    rv = S.rvol[i]
     return Signal(
-        symbol=symbol,
-        side=side,
-        src=src,
-        entry=entry,
-        sl=sl,
-        tp1=tp1,
-        tp2=tp2,
-        score=score,
-        atr=a,
-        rvol=rvol,
-        resid_pct=resid_rank_pct,
-        resid_ret=resid_ret,
-        squeeze=sqz,
-        reason=reason,
-        level_px=float(level),
-    )
+        symbol=symbol, side=side, t=S.t[i], entry=entry, sl=sl, tps=tps, risk=risk,
+        score=score, max_score=MAX_SCORE, conds=conds, trigger=trigger, reversal=reversal,
+        atr=atr, rvol=(0.0 if is_nan(rv) else rv), room_r=room_r,
+        level_name=nearest[0] if nearest else None,
+        level_price=nearest[1] if nearest else None,
+        pdh=None if is_nan(S.pdh[i]) else S.pdh[i],
+        pdl=None if is_nan(S.pdl[i]) else S.pdl[i],
+        ltf=cfg.ltf, htf=cfg.htf,
+        rank=rank, rank_parts={k: int(round(100 * v)) for k, v in parts.items()},
+    ), "ok"
 
 
-def apply_residual_ranks(
-    candidates: list[tuple[str, float, list[dict]]],
-    btc_rows: list[dict],
-) -> dict[str, tuple[float, float]]:
+# ---------------------------------------------------------------------------------------------
+# ALERTA "RETROCESO ALCISTA A LA EMA 20": aviso informativo, independiente de la estrategia de
+# señales (no usa CBC para disparar) y del TOP-N / ranking. Mira solo la última vela cerrada.
+# ---------------------------------------------------------------------------------------------
+EMA20_SLOPE_BARS = 8   # la EMA20 debe estar más alta que hace 8 velas (2 h en 15m)
+EMA20_LOOKBACK = 10    # velas previas en las que se busca el tramo de alejamiento de la EMA20
+
+
+def ema20_pullback(S: Series, i: int, cfg: Config, symbol: str) -> Tuple[Optional[Ema20Alert], str]:
+    """Evalúa la vela CERRADA i. Devuelve (aviso | None, motivo_de_rechazo).
+
+    Hay retroceso alcista a la EMA 20 cuando se cumplen las cuatro cosas:
+      1) Tendencia alcista: EMA 9 >= EMA 20 (nube verde) y la EMA 20 sube (más alta que hace 8 velas).
+         Con EMA20_REQUIRE_EMA200, además el cierre está por encima de la EMA 200.
+      2) Toque: el rango de la vela cruza la EMA 20 (low <= EMA20), como los puntos blancos
+         "EMA20 touch" del indicador de TradingView.
+      3) Respeto: la vela CIERRA por encima de la EMA 20 (si cierra por debajo es una ruptura, no un rebote).
+      4) Es un retroceso de verdad: en las 10 velas previas el precio llegó a estar al menos
+         EMA20_MIN_EXT_ATR veces el ATR por encima de la EMA 20 (no es precio pegado a la media).
     """
-    candidates: list of (symbol, dummy, rows)
-    Returns symbol -> (resid_ret, rank_pct 0-100)
-    """
-    btc_c = [float(r["close"]) for r in btc_rows] if btc_rows else []
-    raw: list[tuple[str, float]] = []
-    for sym, _, rows in candidates:
-        if not rows or not btc_c:
-            continue
-        c = [float(r["close"]) for r in rows]
-        # align lengths
-        n = min(len(c), len(btc_c))
-        if n < 20:
-            continue
-        rr = residual_return(c[-n:], btc_c[-n:], rows[-n:], n - 2)
-        if rr is None:
-            continue
-        raw.append((sym, rr))
-    if not raw:
-        return {}
-    rets = [r for _, r in raw]
-    out = {}
-    for sym, rr in raw:
-        # higher residual → higher rank pct
-        pct = _percentile_rank(rr, rets)
-        out[sym] = (rr, pct)
-    return out
-
-
-def btc_trend_up(btc_rows: list[dict]) -> bool:
-    if not btc_rows or len(btc_rows) < config.BTC_EMA + 2:
-        return True
-    c = [float(r["close"]) for r in btc_rows]
-    e = _ema(c, config.BTC_EMA)
-    i = len(c) - 2
-    return c[i] > e[i]
+    if i < max(EMA20_SLOPE_BARS, EMA20_LOOKBACK) + 1 or i >= len(S.c):
+        return None, "nodata"
+    atr = S.atr[i]
+    if is_nan(atr) or atr <= 0:
+        return None, "nodata"
+    e9, e20, close = S.ema9[i], S.ema20[i], S.c[i]
+    if not (e9 >= e20 and e20 > S.ema20[i - EMA20_SLOPE_BARS]):
+        return None, "no_tendencia"
+    if cfg.ema20_require_ema200 and not close > S.ema200[i]:
+        return None, "bajo_ema200"
+    if S.l[i] > e20:
+        return None, "sin_toque"
+    if close <= e20:
+        return None, "ema20_rota"
+    ext = max(S.h[k] - S.ema20[k] for k in range(i - EMA20_LOOKBACK, i)) / atr
+    if ext < cfg.ema20_min_ext_atr:
+        return None, "sin_retroceso"
+    rv = S.rvol[i]
+    return Ema20Alert(
+        symbol=symbol, t=S.t[i], close=close, low=S.l[i], ema20=e20, atr=atr,
+        dist_pct=(close - e20) / e20 * 100.0, ext_atr=ext,
+        rvol=(0.0 if is_nan(rv) else rv), cbc_green=bool(S.cbc[i]),
+        htf_bull=S.htf_cloud[i], above_vwap=close > S.vwap[i],
+    ), "ok"

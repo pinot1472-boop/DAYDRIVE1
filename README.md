@@ -1,42 +1,21 @@
-# DAYDRIVE v1
+# Bot MapleStax CBC · BingX → Telegram
 
-Bot **complementario a IPDA**: no busca GRAB/Asia. Opera **continuación de sesión** con:
+**Regla (15m):** CBC VERDE → compra la vela ROJA cerrada · CBC ROJO → vende la vela VERDE cerrada.
+El CBC debe ser del mismo color antes y después de cerrar la vela (si esa vela rompe el mínimo/máximo
+anterior, el CBC cambia de color y no se opera). Salida: TP 1R/2R/3R, SL, o cierre cuando el CBC cambia en contra.
 
-1. **Ranking residual** (alt − BTC) en ventana Europa 08:00–13:00 UTC  
-2. Entrada **pullback a EMA 9/21** a favor de tendencia (o **squeeze → expansión**)  
-3. Confirmación **5m** de rechazo en el pullback  
-4. Solo **08:00–20:00 UTC** · evita setups tipo barrido Asia (deja esos a IPDA)
+## Uso
+    pip install -r requirements.txt
+    cp .env.example .env            # rellena TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID
+    python main.py --test-telegram  # prueba de Telegram
+    python main.py --once --dry-run # un análisis, imprime en consola
+    python main.py                  # bot en marcha (Railway)
+    python backtest.py --top 30 --days 14
+    python -m unittest discover -p "test_*.py"
 
-## Señales
-
-| Origen | Qué es |
-|--------|--------|
-| **PB** | Toque EMA + cierre a favor + RVOL |
-| **SQZ** | Compresión ATR + vela de expansión en dirección del residual |
+## Regla pura (sin filtros)
+Por defecto hay filtros (MIN_SCORE=3, MIN_ROOM_R=1). Para que dispare con CADA vela roja en CBC verde
+y CADA vela verde en CBC rojo:  `MIN_SCORE=0  MIN_ROOM_R=0`  (más señales, más ruido).
 
 ## Railway
-
-1. Repo nuevo (no mezclar proceso con IPDA)  
-2. Volumen en `/data`  
-3. Pegar `railway_vars.txt`  
-4. Rellenar `TELEGRAM_*` (BingX si `MODE=LIVE`)  
-5. Deploy → mensaje **DAYDRIVE v1 arrancado**
-
-## Modo
-
-- `MODE=SIGNAL` — solo Telegram (recomendado al inicio)  
-- `MODE=LIVE` + `LIVE_CONFIRMED=true` — orden market + SL/TP en BingX  
-
-## Archivos
-
-```
-bot.py  strategy.py  confirm_5m.py  bingx.py  notify.py
-config.py  railway_vars.txt  Procfile  requirements.txt
-```
-
-## Convivencia con IPDA
-
-- Worker Railway **aparte**  
-- `STATE_PATH=/data/daydrive_state.json` (distinto de IPDA)  
-- Mismos límites de riesgo manuales si compartes cuenta  
-- `SKIP_ASIA_GRAB=true` reduce solape con IPDA  
+Monta un Volume en /data y pon `STATE_FILE=/data/state.json` para no perder las operaciones abiertas al redeploy.
